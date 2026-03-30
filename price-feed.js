@@ -1,5 +1,5 @@
-// Prix réels depuis CoinGecko API (gratuit, pas de clé requise)
-// Refresh toutes les 30 secondes pour éviter le rate limit
+// Prix réels depuis CoinGecko API (Demo key)
+// Refresh toutes les 60 secondes (limite Demo: 30 appels/min, 10k/mois)
 
 const COINGECKO_IDS = {
   "BTC/USDT":  "bitcoin",
@@ -10,21 +10,20 @@ const COINGECKO_IDS = {
   "AVAX/USDT": "avalanche-2",
 };
 
-const PAIRS = Object.keys(COINGECKO_IDS);
-
-// Cache des prix courants
+// Cache des prix courants (valeurs initiales réalistes)
 const priceCache = {
-  "BTC/USDT":  67420,
-  "ETH/USDT":  3510,
-  "SOL/USDT":  178,
-  "BNB/USDT":  598,
-  "XRP/USDT":  0.618,
-  "AVAX/USDT": 36.4,
+  "BTC/USDT":  67000,
+  "ETH/USDT":  2000,
+  "SOL/USDT":  130,
+  "BNB/USDT":  580,
+  "XRP/USDT":  0.55,
+  "AVAX/USDT": 20,
 };
 
-let lastFetch = 0;
+const API_KEY           = process.env.COINGECKO_API_KEY;
+const FETCH_INTERVAL_MS = 60000; // 60s — respecte la limite Demo
+let lastFetch       = 0;
 let fetchInProgress = false;
-const FETCH_INTERVAL_MS = 30000; // 30s
 
 async function fetchPrices() {
   if (fetchInProgress) return;
@@ -34,11 +33,12 @@ async function fetchPrices() {
   fetchInProgress = true;
   try {
     const ids = Object.values(COINGECKO_IDS).join(",");
-    const url = `https://api.coingecko.com/api/v3/simple/price?ids=${ids}&vs_currencies=usd`;
+    const key = API_KEY ? `&x_cg_demo_api_key=${API_KEY}` : "";
+    const url = `https://api.coingecko.com/api/v3/simple/price?ids=${ids}&vs_currencies=usd${key}`;
 
     const res = await fetch(url, {
       headers: { "Accept": "application/json" },
-      signal: AbortSignal.timeout(8000),
+      signal: AbortSignal.timeout(10000),
     });
 
     if (!res.ok) throw new Error(`CoinGecko HTTP ${res.status}`);
@@ -51,10 +51,10 @@ async function fetchPrices() {
     }
 
     lastFetch = Date.now();
-    console.log(`📡 Prix mis à jour — BTC: $${priceCache["BTC/USDT"].toLocaleString()}`);
+    console.log(`📡 Prix mis à jour — BTC: $${priceCache["BTC/USDT"].toLocaleString()} | ETH: $${priceCache["ETH/USDT"].toLocaleString()}`);
 
   } catch (err) {
-    console.warn(`⚠️ CoinGecko fetch échoué: ${err.message} — prix cache conservés`);
+    console.warn(`⚠️  CoinGecko fetch échoué: ${err.message} — prix cache conservés`);
   } finally {
     fetchInProgress = false;
   }
@@ -67,19 +67,12 @@ function roundPrice(pair, value) {
   return Number(value.toFixed(5));
 }
 
-// Retourne le prix actuel (avec légère variation simulée pour les bots)
+// Retourne le prix actuel + micro-variation pour animer les bots
 export function nextPrice(pair) {
-  // Fetch en arrière-plan si besoin
   fetchPrices().catch(() => {});
-
-  const base = priceCache[pair] ?? 100;
-
-  // Petite variation aléatoire ±0.15% pour simuler le tick
-  // (les vrais prix se rafraîchissent toutes les 30s)
-  const noise = 1 + (Math.random() - 0.5) * 0.003;
-  const price = base * noise;
-
-  return roundPrice(pair, price);
+  const base  = priceCache[pair] ?? 100;
+  const noise = 1 + (Math.random() - 0.5) * 0.002; // ±0.1%
+  return roundPrice(pair, base * noise);
 }
 
 // Fetch immédiat au démarrage
