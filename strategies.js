@@ -2,8 +2,13 @@ export function fmt(n, d = 2) {
   return Number(Number(n).toFixed(d));
 }
 
+// Frais Binance : 0.1% maker + 0.1% taker = 0.2% par aller-retour
+const FEE_RATE = 0.001; // 0.1% par ordre
+
 export function calcPnl(entryPrice, exitPrice, orderSize) {
-  return fmt(((exitPrice - entryPrice) / entryPrice) * orderSize, 2);
+  const gross = ((exitPrice - entryPrice) / entryPrice) * orderSize;
+  const fees  = orderSize * FEE_RATE * 2; // BUY fee + SELL fee
+  return fmt(gross - fees, 2);
 }
 
 // ── Helpers ──────────────────────────────────────────
@@ -48,6 +53,7 @@ function initRuntime(state) {
   return {
     pos:          state?.runtime?.pos          ?? null,
     lastBuy:      state?.runtime?.lastBuy      ?? 0,
+    lastTrade:    state?.runtime?.lastTrade    ?? 0,   // timestamp dernier trade
     lastGI:       state?.runtime?.lastGI       ?? null,
     priceHistory: state?.runtime?.priceHistory ?? [],
     highWater:    state?.runtime?.highWater    ?? null,
@@ -56,6 +62,19 @@ function initRuntime(state) {
     fearTick:     state?.runtime?.fearTick     ?? 0,
   };
 }
+
+// Cooldowns minimaux par stratégie (en ms)
+// Empêche de trader à chaque tick de 5 secondes
+const COOLDOWNS = {
+  grid:     60  * 1000,  // min 1 minute entre trades Grid
+  dca:      0,           // DCA gère son propre intervalle
+  scalp:    30  * 1000,  // min 30s entre trades Scalp
+  trend:    120 * 1000,  // min 2 minutes Trend
+  breakout: 120 * 1000,  // min 2 minutes Breakout
+  bb:       90  * 1000,  // min 90s BB Squeeze
+  macd:     120 * 1000,  // min 2 minutes MACD
+  feargreed:300 * 1000,  // min 5 minutes Fear & Greed
+};
 
 // ── Main tick ─────────────────────────────────────────
 export function runTick(bot, state, price) {
@@ -71,7 +90,10 @@ export function runTick(bot, state, price) {
   next.runtime.priceHistory = [...next.runtime.priceHistory, price].slice(-100);
 
   let trade = null;
-  const orderSize = Number(config.orderSize || bot.budget || 100);
+  const orderSize  = Number(config.orderSize || bot.budget || 100);
+  const now        = Date.now();
+  const cooldown   = COOLDOWNS[bot.strategy] ?? 60000;
+  const canTrade   = (now - (next.runtime.lastTrade || 0)) >= cooldown;
 
   // ════════════════════════════════════════
   // GRID
@@ -87,25 +109,33 @@ export function runTick(bot, state, price) {
     const prev = next.runtime.lastGI ?? gi;
 
     if (price >= low && price <= high) {
-      if (gi < prev && !next.runtime.pos) {
-        next.runtime.pos    = price;
-        next.runtime.lastGI = gi;
+      // BUY : on descend d'un niveau + pas de position + cooldown respecté
+      if (gi < prev && !next.runtime.pos && canTrade) {
+        next.runtime.pos       = price;
+        next.runtime.lastGI    = gi;
+        next.runtime.lastTrade = now;
         trade = { a: "BUY", r: `Grid ↓ niv.${gi}` };
-      } else if (gi > prev && next.runtime.pos) {
+
+      // SELL : on monte d'un niveau + position ouverte + cooldown respecté
+      } else if (gi > prev && next.runtime.pos && canTrade) {
         const pnl = calcPnl(next.runtime.pos, price, orderSize);
-        next.pnl            = fmt(next.pnl + pnl);
-        next.runtime.pos    = null;
-        next.runtime.lastGI = gi;
+        next.pnl               = fmt(next.pnl + pnl);
+        next.runtime.pos       = null;
+        next.runtime.lastGI    = gi;
+        next.runtime.lastTrade = now;
         trade = { a: "SELL", r: `Grid ↑ niv.${gi}`, p: pnl };
+
       } else {
         next.runtime.lastGI = gi;
       }
     }
 
+    // Stop-loss (toujours actif, pas de cooldown)
     if (next.runtime.pos && price <= next.runtime.pos * (1 - stopLoss / 100)) {
       const pnl = calcPnl(next.runtime.pos, price, orderSize);
-      next.pnl         = fmt(next.pnl + pnl);
-      next.runtime.pos = null;
+      next.pnl               = fmt(next.pnl + pnl);
+      next.runtime.pos       = null;
+      next.runtime.lastTrade = now;
       trade = { a: "SELL", r: "🛑 SL", p: pnl };
     }
   }
@@ -114,29 +144,31 @@ export function runTick(bot, state, price) {
   // DCA
   // ════════════════════════════════════════
   if (bot.strategy === "dca") {
-    const now         = Date.now();
     const intervalMin = Number(config.intervalMin || 15);
     const takeProfit  = Number(config.takeProfit  || 3);
     const stopLoss    = Number(config.stopLoss    || 10);
     const intervalMs  = intervalMin * 60000;
 
     if (!next.runtime.pos && (now - next.runtime.lastBuy) >= intervalMs) {
-      next.runtime.pos     = price;
-      next.runtime.lastBuy = now;
+      next.runtime.pos       = price;
+      next.runtime.lastBuy   = now;
+      next.runtime.lastTrade = now;
       trade = { a: "BUY", r: "DCA auto" };
     }
 
     if (next.runtime.pos && price >= next.runtime.pos * (1 + takeProfit / 100)) {
       const pnl = calcPnl(next.runtime.pos, price, orderSize);
-      next.pnl         = fmt(next.pnl + pnl);
-      next.runtime.pos = null;
+      next.pnl               = fmt(next.pnl + pnl);
+      next.runtime.pos       = null;
+      next.runtime.lastTrade = now;
       trade = { a: "SELL", r: `✅ TP +${takeProfit}%`, p: pnl };
     }
 
     if (next.runtime.pos && price <= next.runtime.pos * (1 - stopLoss / 100)) {
       const pnl = calcPnl(next.runtime.pos, price, orderSize);
-      next.pnl         = fmt(next.pnl + pnl);
-      next.runtime.pos = null;
+      next.pnl               = fmt(next.pnl + pnl);
+      next.runtime.pos       = null;
+      next.runtime.lastTrade = now;
       trade = { a: "SELL", r: "🛑 SL", p: pnl };
     }
   }
@@ -145,16 +177,17 @@ export function runTick(bot, state, price) {
   // SCALPING RSI
   // ════════════════════════════════════════
   if (bot.strategy === "scalp") {
-    const rsiOversold  = Number(config.rsiOversold  || 32);
-    const rsiOverbought= Number(config.rsiOverbought|| 68);
-    const takeProfit   = Number(config.takeProfit   || 0.5);
-    const stopLoss     = Number(config.stopLoss     || 0.3);
+    const rsiOversold   = Number(config.rsiOversold   || 32);
+    const rsiOverbought = Number(config.rsiOverbought || 68);
+    const takeProfit    = Number(config.takeProfit    || 0.5);
+    const stopLoss      = Number(config.stopLoss      || 0.3);
 
     const ph  = next.runtime.priceHistory;
     const rsi = ph.length >= 14 ? calcRSI(ph.slice(-14)) : 50;
 
-    if (!next.runtime.pos && rsi < rsiOversold) {
-      next.runtime.pos = price;
+    if (!next.runtime.pos && rsi < rsiOversold && canTrade) {
+      next.runtime.pos       = price;
+      next.runtime.lastTrade = now;
       trade = { a: "BUY", r: `RSI ${rsi.toFixed(0)}` };
     }
 
@@ -162,63 +195,62 @@ export function runTick(bot, state, price) {
       const gain = (price - next.runtime.pos) / next.runtime.pos * 100;
       const loss = (next.runtime.pos - price) / next.runtime.pos * 100;
 
-      if (rsi > rsiOverbought || gain >= takeProfit) {
+      if ((rsi > rsiOverbought || gain >= takeProfit) && canTrade) {
         const pnl = calcPnl(next.runtime.pos, price, orderSize);
-        next.pnl         = fmt(next.pnl + pnl);
-        next.runtime.pos = null;
+        next.pnl               = fmt(next.pnl + pnl);
+        next.runtime.pos       = null;
+        next.runtime.lastTrade = now;
         trade = { a: "SELL", r: `RSI ${rsi.toFixed(0)} / TP`, p: pnl };
       } else if (loss >= stopLoss) {
         const pnl = calcPnl(next.runtime.pos, price, orderSize);
-        next.pnl         = fmt(next.pnl + pnl);
-        next.runtime.pos = null;
+        next.pnl               = fmt(next.pnl + pnl);
+        next.runtime.pos       = null;
+        next.runtime.lastTrade = now;
         trade = { a: "SELL", r: "🛑 SL", p: pnl };
       }
     }
   }
 
   // ════════════════════════════════════════
-  // TREND FOLLOWING (MA crossover)
+  // TREND FOLLOWING
   // ════════════════════════════════════════
   if (bot.strategy === "trend") {
     const fastMA   = Math.max(3,  Number(config.fastMA   || 9));
     const slowMA   = Math.max(10, Number(config.slowMA   || 21));
-    const stopLoss = Number(config.stopLoss  || 5);
-    const trailPct = Number(config.trailPct  || 2);
+    const stopLoss = Number(config.stopLoss || 5);
+    const trailPct = Number(config.trailPct || 2);
 
     const ph = next.runtime.priceHistory;
 
     if (ph.length >= slowMA) {
-      const fast = calcSMA(ph, fastMA);
-      const slow = calcSMA(ph, slowMA);
-
-      // Previous fast/slow (one tick ago)
-      const phPrev = ph.slice(0, -1);
+      const fast     = calcSMA(ph, fastMA);
+      const slow     = calcSMA(ph, slowMA);
+      const phPrev   = ph.slice(0, -1);
       const fastPrev = phPrev.length >= fastMA ? calcSMA(phPrev, fastMA) : fast;
       const slowPrev = phPrev.length >= slowMA ? calcSMA(phPrev, slowMA) : slow;
 
-      // Bullish crossover → BUY
-      if (!next.runtime.pos && fastPrev <= slowPrev && fast > slow) {
+      if (!next.runtime.pos && fastPrev <= slowPrev && fast > slow && canTrade) {
         next.runtime.pos       = price;
         next.runtime.highWater = price;
+        next.runtime.lastTrade = now;
         trade = { a: "BUY", r: `MA↑ fast=${fast.toFixed(0)} slow=${slow.toFixed(0)}` };
       }
 
       if (next.runtime.pos) {
-        // Update high water mark for trailing stop
         if (price > (next.runtime.highWater || price)) {
           next.runtime.highWater = price;
         }
-
         const trailStop = next.runtime.highWater * (1 - trailPct / 100);
         const hardStop  = next.runtime.pos * (1 - stopLoss / 100);
         const bearCross = fastPrev >= slowPrev && fast < slow;
 
-        if (bearCross || price <= trailStop || price <= hardStop) {
+        if (price <= trailStop || price <= hardStop || bearCross) {
+          const reason = bearCross ? "MA↓ crossover" : price <= hardStop ? "🛑 SL" : `🔒 Trail ${trailPct}%`;
           const pnl = calcPnl(next.runtime.pos, price, orderSize);
           next.pnl               = fmt(next.pnl + pnl);
           next.runtime.pos       = null;
           next.runtime.highWater = null;
-          const reason = bearCross ? "MA↓ croisement" : price <= hardStop ? "🛑 SL" : "🛑 Trailing";
+          next.runtime.lastTrade = now;
           trade = { a: "SELL", r: reason, p: pnl };
         }
       }
@@ -237,13 +269,13 @@ export function runTick(bot, state, price) {
     const ph = next.runtime.priceHistory;
 
     if (ph.length >= lookback) {
-      const window    = ph.slice(-lookback - 1, -1); // exclude current price
-      const resistance= Math.max(...window);
-      const threshold = resistance * (1 + breakoutPct / 100);
+      const window     = ph.slice(-lookback - 1, -1);
+      const resistance = Math.max(...window);
+      const threshold  = resistance * (1 + breakoutPct / 100);
 
-      // BUY on breakout above resistance
-      if (!next.runtime.pos && price >= threshold) {
-        next.runtime.pos = price;
+      if (!next.runtime.pos && price >= threshold && canTrade) {
+        next.runtime.pos       = price;
+        next.runtime.lastTrade = now;
         trade = { a: "BUY", r: `Breakout ${resistance.toFixed(0)} → ${price.toFixed(0)}` };
       }
     }
@@ -254,20 +286,22 @@ export function runTick(bot, state, price) {
 
       if (gain >= takeProfit) {
         const pnl = calcPnl(next.runtime.pos, price, orderSize);
-        next.pnl         = fmt(next.pnl + pnl);
-        next.runtime.pos = null;
+        next.pnl               = fmt(next.pnl + pnl);
+        next.runtime.pos       = null;
+        next.runtime.lastTrade = now;
         trade = { a: "SELL", r: `✅ TP +${takeProfit}%`, p: pnl };
       } else if (loss >= stopLoss) {
         const pnl = calcPnl(next.runtime.pos, price, orderSize);
-        next.pnl         = fmt(next.pnl + pnl);
-        next.runtime.pos = null;
+        next.pnl               = fmt(next.pnl + pnl);
+        next.runtime.pos       = null;
+        next.runtime.lastTrade = now;
         trade = { a: "SELL", r: "🛑 SL", p: pnl };
       }
     }
   }
 
   // ════════════════════════════════════════
-  // BB SQUEEZE (Bollinger Bands)
+  // BB SQUEEZE
   // ════════════════════════════════════════
   if (bot.strategy === "bb") {
     const bbPeriod         = Math.max(5, Number(config.bbPeriod         || 20));
@@ -279,12 +313,12 @@ export function runTick(bot, state, price) {
     const ph = next.runtime.priceHistory;
 
     if (ph.length >= bbPeriod) {
-      const bb = calcBollinger(ph, bbPeriod, bbStdDev);
+      const bb           = calcBollinger(ph, bbPeriod, bbStdDev);
       const bandwidthPct = bb.bandwidth * 100;
 
-      // Squeeze detected + price breaks above mid → BUY
-      if (!next.runtime.pos && bandwidthPct <= squeezeThreshold && price > bb.mid) {
-        next.runtime.pos = price;
+      if (!next.runtime.pos && bandwidthPct <= squeezeThreshold && price > bb.mid && canTrade) {
+        next.runtime.pos       = price;
+        next.runtime.lastTrade = now;
         trade = { a: "BUY", r: `BB Squeeze bw=${bandwidthPct.toFixed(1)}%` };
       }
     }
@@ -295,13 +329,15 @@ export function runTick(bot, state, price) {
 
       if (gain >= takeProfit) {
         const pnl = calcPnl(next.runtime.pos, price, orderSize);
-        next.pnl         = fmt(next.pnl + pnl);
-        next.runtime.pos = null;
+        next.pnl               = fmt(next.pnl + pnl);
+        next.runtime.pos       = null;
+        next.runtime.lastTrade = now;
         trade = { a: "SELL", r: `✅ TP +${takeProfit}%`, p: pnl };
       } else if (loss >= stopLoss) {
         const pnl = calcPnl(next.runtime.pos, price, orderSize);
-        next.pnl         = fmt(next.pnl + pnl);
-        next.runtime.pos = null;
+        next.pnl               = fmt(next.pnl + pnl);
+        next.runtime.pos       = null;
+        next.runtime.lastTrade = now;
         trade = { a: "SELL", r: "🛑 SL", p: pnl };
       }
     }
@@ -320,11 +356,10 @@ export function runTick(bot, state, price) {
     const ph = next.runtime.priceHistory;
 
     if (ph.length >= macdSlow + macdSignal) {
-      const emaFast = calcEMA(ph, macdFast);
-      const emaSlow = calcEMA(ph, macdSlow);
+      const emaFast  = calcEMA(ph, macdFast);
+      const emaSlow  = calcEMA(ph, macdSlow);
       const macdLine = emaFast - emaSlow;
 
-      // Signal line = EMA of MACD line (approximate with recent history)
       const macdHistory = ph.slice(-macdSignal - 5).map((_, i, arr) => {
         const slice = ph.slice(0, ph.length - macdSignal - 5 + i + 1);
         if (slice.length < macdSlow) return 0;
@@ -332,16 +367,15 @@ export function runTick(bot, state, price) {
       });
       const signalLine = calcEMA(macdHistory, macdSignal);
 
-      // Previous values
-      const phPrev = ph.slice(0, -1);
+      const phPrev      = ph.slice(0, -1);
       const emaFastPrev = calcEMA(phPrev, macdFast);
       const emaSlowPrev = calcEMA(phPrev, macdSlow);
-      const macdPrev = emaFastPrev - emaSlowPrev;
-      const signalPrev = signalLine * 0.98; // approximation
+      const macdPrev    = emaFastPrev - emaSlowPrev;
+      const signalPrev  = signalLine * 0.98;
 
-      // Bullish crossover: MACD crosses above signal
-      if (!next.runtime.pos && macdPrev <= signalPrev && macdLine > signalLine && macdLine > 0) {
-        next.runtime.pos = price;
+      if (!next.runtime.pos && macdPrev <= signalPrev && macdLine > signalLine && macdLine > 0 && canTrade) {
+        next.runtime.pos       = price;
+        next.runtime.lastTrade = now;
         trade = { a: "BUY", r: `MACD↑ ${macdLine.toFixed(1)}` };
       }
     }
@@ -352,13 +386,15 @@ export function runTick(bot, state, price) {
 
       if (gain >= takeProfit) {
         const pnl = calcPnl(next.runtime.pos, price, orderSize);
-        next.pnl         = fmt(next.pnl + pnl);
-        next.runtime.pos = null;
+        next.pnl               = fmt(next.pnl + pnl);
+        next.runtime.pos       = null;
+        next.runtime.lastTrade = now;
         trade = { a: "SELL", r: `✅ TP +${takeProfit}%`, p: pnl };
       } else if (loss >= stopLoss) {
         const pnl = calcPnl(next.runtime.pos, price, orderSize);
-        next.pnl         = fmt(next.pnl + pnl);
-        next.runtime.pos = null;
+        next.pnl               = fmt(next.pnl + pnl);
+        next.runtime.pos       = null;
+        next.runtime.lastTrade = now;
         trade = { a: "SELL", r: "🛑 SL", p: pnl };
       }
     }
@@ -373,12 +409,10 @@ export function runTick(bot, state, price) {
     const takeProfit     = Number(config.takeProfit     || 10);
     const stopLoss       = Number(config.stopLoss       || 8);
 
-    // Simulate Fear & Greed index update every ~10 ticks
     next.runtime.fearTick = (next.runtime.fearTick || 0) + 1;
     if (next.runtime.fearTick >= 10) {
       next.runtime.fearTick = 0;
-      // Random walk on fear index, biased toward current market direction
-      const ph = next.runtime.priceHistory;
+      const ph    = next.runtime.priceHistory;
       const trend = ph.length >= 5 ? (ph[ph.length - 1] - ph[ph.length - 5]) / ph[ph.length - 5] * 100 : 0;
       const delta = (Math.random() - 0.5) * 12 + trend * 2;
       next.runtime.fearIndex = Math.max(0, Math.min(100, (next.runtime.fearIndex || 50) + delta));
@@ -386,34 +420,35 @@ export function runTick(bot, state, price) {
 
     const fearIndex = next.runtime.fearIndex || 50;
 
-    // Extreme fear → BUY (contrarian)
-    if (!next.runtime.pos && fearIndex <= fearThreshold) {
-      next.runtime.pos = price;
+    if (!next.runtime.pos && fearIndex <= fearThreshold && canTrade) {
+      next.runtime.pos       = price;
+      next.runtime.lastTrade = now;
       trade = { a: "BUY", r: `😨 Fear ${fearIndex.toFixed(0)}` };
     }
 
-    // Extreme greed → SELL (take profit)
-    if (next.runtime.pos && fearIndex >= greedThreshold) {
+    if (next.runtime.pos && fearIndex >= greedThreshold && canTrade) {
       const pnl = calcPnl(next.runtime.pos, price, orderSize);
-      next.pnl         = fmt(next.pnl + pnl);
-      next.runtime.pos = null;
+      next.pnl               = fmt(next.pnl + pnl);
+      next.runtime.pos       = null;
+      next.runtime.lastTrade = now;
       trade = { a: "SELL", r: `🤑 Greed ${fearIndex.toFixed(0)}`, p: pnl };
     }
 
-    // TP / SL classiques
     if (next.runtime.pos) {
       const gain = (price - next.runtime.pos) / next.runtime.pos * 100;
       const loss = (next.runtime.pos - price) / next.runtime.pos * 100;
 
       if (gain >= takeProfit) {
         const pnl = calcPnl(next.runtime.pos, price, orderSize);
-        next.pnl         = fmt(next.pnl + pnl);
-        next.runtime.pos = null;
+        next.pnl               = fmt(next.pnl + pnl);
+        next.runtime.pos       = null;
+        next.runtime.lastTrade = now;
         trade = { a: "SELL", r: `✅ TP +${takeProfit}%`, p: pnl };
       } else if (loss >= stopLoss) {
         const pnl = calcPnl(next.runtime.pos, price, orderSize);
-        next.pnl         = fmt(next.pnl + pnl);
-        next.runtime.pos = null;
+        next.pnl               = fmt(next.pnl + pnl);
+        next.runtime.pos       = null;
+        next.runtime.lastTrade = now;
         trade = { a: "SELL", r: "🛑 SL", p: pnl };
       }
     }
@@ -421,13 +456,13 @@ export function runTick(bot, state, price) {
 
   // ── Log trade ────────────────────────────────────────
   if (trade) {
-    const now = new Date();
+    const nowDate = new Date();
     next.log = [{
       ...trade,
       price,
-      ts:   now.toISOString(),
-      t:    now.toLocaleTimeString("fr-FR"),
-      date: now.toLocaleDateString("fr-FR"),
+      ts:   nowDate.toISOString(),
+      t:    nowDate.toLocaleTimeString("fr-FR"),
+      date: nowDate.toLocaleDateString("fr-FR"),
     }, ...next.log].slice(0, 100);
     next.trades += 1;
   }
