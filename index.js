@@ -5,6 +5,9 @@ import { runTick } from "./strategies.js";
 const TICK_MS = 5000;
 let busy = false;
 
+// Toutes les paires suivies
+const PAIRS = ["BTC/USDT", "ETH/USDT", "SOL/USDT", "BNB/USDT", "XRP/USDT", "AVAX/USDT"];
+
 async function loadBots() {
   const { data, error } = await supabase
     .from("bots")
@@ -22,9 +25,7 @@ async function loadState(botId) {
     .eq("bot_id", botId)
     .maybeSingle();
 
-  if (error && error.code !== "PGRST116") {
-    throw error;
-  }
+  if (error && error.code !== "PGRST116") throw error;
 
   return data || {
     bot_id: botId,
@@ -38,9 +39,9 @@ async function loadState(botId) {
 async function saveState(botId, state) {
   const payload = {
     bot_id: botId,
-    pnl: Number(state.pnl || 0),
-    trades: Number(state.trades || 0),
-    log: state.log || [],
+    pnl:     Number(state.pnl    || 0),
+    trades:  Number(state.trades || 0),
+    log:     state.log     || [],
     runtime: state.runtime || {}
   };
 
@@ -70,7 +71,7 @@ async function updateWallet(userId, delta) {
     .upsert(
       {
         user_id: userId,
-        eur: Number(current.eur || 0),
+        eur:  Number(current.eur || 0),
         usdt: Math.max(0, newUsdt)
       },
       { onConflict: "user_id" }
@@ -79,6 +80,22 @@ async function updateWallet(userId, delta) {
   if (writeError) throw writeError;
 }
 
+// ── Écriture des prix dans Supabase ──────────────────
+async function savePrices(priceMap) {
+  const rows = Object.entries(priceMap).map(([pair, price]) => ({
+    pair,
+    price,
+    updated_at: new Date().toISOString()
+  }));
+
+  const { error } = await supabase
+    .from("prices")
+    .upsert(rows, { onConflict: "pair" });
+
+  if (error) console.error("❌ savePrices:", error.message);
+}
+
+// ── Tick principal ────────────────────────────────────
 async function tick() {
   if (busy) return;
   busy = true;
@@ -86,10 +103,20 @@ async function tick() {
   try {
     const bots = await loadBots();
 
+    // Calculer un prix par paire (une seule fois par tick)
+    const priceMap = {};
+    for (const pair of PAIRS) {
+      priceMap[pair] = nextPrice(pair);
+    }
+
+    // Écrire tous les prix dans Supabase (fire & forget)
+    savePrices(priceMap);
+
+    // Faire tourner chaque bot
     for (const bot of bots) {
       try {
         const oldState = await loadState(bot.id);
-        const price = nextPrice(bot.pair);
+        const price    = priceMap[bot.pair] ?? nextPrice(bot.pair);
         const newState = runTick(bot, oldState, price);
 
         await saveState(bot.id, newState);
@@ -110,13 +137,14 @@ async function tick() {
         }
 
         console.log(
-  `🤖 ${bot.name} | id=${bot.id} | ${bot.strategy} | ${bot.pair} | price=${price} | pnl=${newState.pnl}`
-);
-        
+          `🤖 ${bot.name} | ${bot.strategy} | ${bot.pair} | price=${price} | pnl=${newState.pnl}`
+        );
+
       } catch (botError) {
         console.error(`❌ Bot ${bot.name}:`, botError.message);
       }
     }
+
   } catch (error) {
     console.error("❌ Erreur globale:", error.message);
   } finally {
